@@ -1,17 +1,49 @@
 module Main where
 
+import Control.Monad.Except
+import Data.Functor
 import System.Environment
 import Text.ParserCombinators.Parsec hiding (spaces)
 import Text.Read.Lex (Number)
 
 main :: IO ()
-main =
-  print . eval . readExpr . head =<< getArgs
+main = do
+  args <- getArgs
+  let evaled = fmap show $ readExpr (head args) >>= eval
+  putStrLn $ extractValue $ trapError evaled
 
-readExpr :: String -> LispVal
+readExpr :: String -> ThrowsError LispVal
 readExpr str = case parse parseExpr "lisp" str of
-  Left err -> String $ "Error " ++ show err
-  Right val -> val
+  Left err -> throwError $ Parser err
+  Right val -> return val
+
+data LispError
+  = NumArgs Integer [LispVal]
+  | TypeMismatch String LispVal
+  | Parser ParseError
+  | BadSpecialForm String LispVal
+  | NotFunction String String
+  | UnboundVar String String
+  | Default String
+
+instance Show LispError where
+  show = showError
+
+type ThrowsError = Either LispError
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
+
+trapError action = catchError action (return . show)
+
+showError :: LispError -> String
+showError (NumArgs expected found) = "Expected: " ++ show expected ++ " args, found values " ++ unwordsList found
+showError (TypeMismatch expected found) = "Invalid type: expected: " ++ show expected ++ ", but found " ++ show found
+showError (Parser err) = "Parse error at " ++ show err
+showError (BadSpecialForm message form) = message ++ ": " ++ show form
+showError (NotFunction message func) = message ++ ": " ++ show func
+showError (UnboundVar message varname) = message ++ ": " ++ varname
+showError (Default _) = "An error has occurred"
 
 data LispVal
   = Atom String
@@ -33,17 +65,21 @@ showVal (Bool False) = "#f"
 showVal (List l) = "(" ++ unwordsList l ++ ")"
 showVal (DottedList head tail) = "(" ++ unwordsList head ++ showVal tail ++ ")"
 
-eval :: LispVal -> LispVal
-eval val@(Bool _) = val
-eval val@(Number _) = val
-eval val@(String _) = val
-eval (List [Atom "quote", val]) = val
-eval (List (Atom func : args)) = apply func $ map eval args
+eval :: LispVal -> ThrowsError LispVal
+eval val@(Bool _) = return val
+eval val@(Number _) = return val
+eval val@(String _) = return val
+eval (List [Atom "quote", val]) = return val
+eval (List (Atom func : args)) = mapM eval args >>= apply func
 
-apply :: String -> [LispVal] -> LispVal
-apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+apply :: String -> [LispVal] -> ThrowsError LispVal
+apply func args =
+  maybe
+    (throwError $ NotFunction "Unrecognized primitive function args" func)
+    ($ args)
+    $ lookup func primitives
 
-primitives :: [(String, [LispVal] -> LispVal)]
+primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives =
   [ ("+", numericBinop (+)),
     ("-", numericBinop (-)),
@@ -54,33 +90,22 @@ primitives =
     ("remainder", numericBinop rem)
   ]
 
-numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
-numericBinop op params = Number $ foldl1 op $ map unpackNum params
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
+numericBinop op singleVal@[_] = throwError $ NumArgs 2 singleVal
+numericBinop op params = mapM unpackNum params <&> (Number . foldl1 op)
 
-unpackNum :: LispVal -> Integer
-unpackNum (Number n) = n
+unpackNum :: LispVal -> ThrowsError Integer
+unpackNum (Number n) = return n
 unpackNum (String n) =
   let parsed = reads n
    in if null parsed
-        then 0
-        else fst $ head parsed
+        then throwError $ TypeMismatch "number" $ String n
+        else return $ fst $ head parsed
 unpackNum (List [n]) = unpackNum n
-unpackNum _ = 0
+unpackNum notNum = throwError $ TypeMismatch "number" notNum
 
 unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
-
--- TODO: Used for debugging
-toString :: LispVal -> String
-toString val =
-  case val of
-    Atom _ -> "Atom"
-    Array _ -> "Array"
-    Bool _ -> "Bool"
-    DottedList _ _ -> "DottedList"
-    List _ -> "List"
-    Number _ -> "Number"
-    String _ -> "String"
 
 spaces :: Parser ()
 spaces = skipMany1 space
